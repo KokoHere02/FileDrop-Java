@@ -1,0 +1,10 @@
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+app:
+  allowed-origins: ${FILEDROP_ALLOWED_ORIGINS:http://localhost:5173}
+  heartbeat:
+    interval-ms: 20000
+    timeout-ms: 60000
+    scan-ms: 5000
