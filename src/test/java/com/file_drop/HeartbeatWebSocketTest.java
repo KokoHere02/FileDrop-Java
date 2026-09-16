@@ -112,9 +112,63 @@ class HeartbeatWebSocketTest {
 
   private record Frame(int opcode, byte[] payload) {}
 
+  @Test
+  void actualUpgradeRejectsInvalidParametersAndOrigin() throws Exception {
+    assertUpgradeStatus("/api/ws?code=abc&role=sender", "http://localhost:5173", 400);
+    assertUpgradeStatus("/api/ws?code=abc123&role=sender&role=receiver", "http://localhost:5173", 400);
+    assertUpgradeStatus("/api/ws?code=abc123&role=receiver", "https://untrusted.example", 403);
+  }
 
+  private void assertUpgradeStatus(String path, String origin, int status) throws Exception {
+    try (Socket socket = new Socket("127.0.0.1", port)) {
+      socket.setSoTimeout(5000);
+      String request = "GET " + path + " HTTP/1.1\r\nHost: localhost:" + port
+          + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nOrigin: " + origin
+          + "\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+      socket.getOutputStream().write(request.getBytes(StandardCharsets.US_ASCII));
+      var reader = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+      assertTrue(reader.readLine().startsWith("HTTP/1.1 " + status));
+    }
+  }
 
+  @Test
+  void abruptTcpResetNotifiesPeerAndAllowsAuthenticatedReconnect() throws Exception {
+    String code = createRoom();
+    try (Socket receiver = connect(code, "receiver", null); Socket sender = connect(code)) {
+      assertEquals("accepted", readSignal(receiver).getType());
+      assertEquals("accepted", readSignal(sender).getType());
+      assertEquals("peer-ready", readSignal(receiver).getType());
+      assertEquals("peer-ready", readSignal(sender).getType());
+      sender.setSoLinger(true, 0); // RST without a WebSocket close handshake.
+      sender.close();
+      assertEquals("reset", readSignal(receiver).getType());
+      try (Socket replacement = connect(code)) {
+        assertEquals("accepted", readSignal(replacement).getType());
+        assertEquals("peer-ready", readSignal(receiver).getType());
+        assertEquals("peer-ready", readSignal(replacement).getType());
+      }
+    }
+  }
 
+  @Test
+  void incompleteSlowFrameDoesNotBlockOtherRoomsAndTimesOut() throws Exception {
+    String code = createRoom();
+    try (Socket slow = connect(code)) {
+      assertEquals("accepted", readSignal(slow).getType());
+      // Declare a masked text frame but withhold most of its payload indefinitely.
+      slow.getOutputStream().write(new byte[]{(byte) 0x81, (byte) 0x8a, 1, 2, 3, 4, 5});
+      try (Socket healthy = connect(createRoom())) {
+        assertEquals("accepted", readSignal(healthy).getType());
+      }
+      assertEquals(9, readFrame(slow).opcode());
+      Frame close = readFrame(slow);
+      assertEquals(8, close.opcode());
+      assertEquals(4001, ByteBuffer.wrap(close.payload()).getShort());
+      try (Socket replacement = connect(code)) {
+        assertEquals("accepted", readSignal(replacement).getType());
+      }
+    }
+  }
 
   private com.file_drop.entity.WebRTCMessage readSignal(Socket socket) throws Exception {
     Frame frame = readFrame(socket);
