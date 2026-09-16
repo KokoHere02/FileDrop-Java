@@ -58,6 +58,15 @@ class WebRtcServiceTest {
     return (Map<String, WebRTCRoom>) ReflectionTestUtils.getField(service, "rooms");
   }
 
+  private void forward(String roomCode, String role, WebSocketSession session, WebRTCMessage message) {
+    var room = rooms().get(roomCode);
+    if (room != null) {
+      var target = role.equals("sender") ? room.getReceivers().values().stream().findFirst().orElse(null) : room.getSender();
+      if (target != null) message.setTo(target.getId());
+    }
+    service.forwardMessage(roomCode, role, session, message);
+  }
+
   private WebSocketSession session(String id) {
     WebSocketSession session = mock(WebSocketSession.class);
     when(session.getId()).thenReturn(id);
@@ -105,10 +114,10 @@ class WebRtcServiceTest {
     clearInvocations(sender, receiver);
     assertFalse(join("sender", intruder, code));
     service.removeClient(code, "sender", intruder);
-    service.forwardMessage(code, "sender", intruder, WebRTCMessage.builder().type("offer").build());
+    forward(code, "sender", intruder, WebRTCMessage.builder().type("offer").build());
     verify(receiver, never()).sendMessage(any());
     assertFalse(join("sender", session("another"), code));
-    service.forwardMessage(code, "sender", sender, WebRTCMessage.builder().type("offer").build());
+    forward(code, "sender", sender, WebRTCMessage.builder().type("offer").build());
     verify(receiver).sendMessage(any(TextMessage.class));
   }
 
@@ -127,7 +136,7 @@ class WebRtcServiceTest {
       assertEquals("peer-ready", joined.getType());
       clearInvocations(second);
       assertNotEquals(joined.getFrom(), joined.getTo());
-      service.forwardMessage(roomCode, firstRole, first,
+      forward(roomCode, firstRole, first,
           WebRTCMessage.builder().type("offer").from("spoofed").to("spoofed").payload("sdp").build());
       verify(second).sendMessage(capture.capture());
       WebRTCMessage forwarded = JsonUtil.fromJson(capture.getValue().getPayload(), WebRTCMessage.class);
@@ -212,7 +221,7 @@ class WebRtcServiceTest {
     }).when(sender).sendMessage(any());
     var executor = Executors.newFixedThreadPool(2);
     try {
-      var blocked = executor.submit(() -> service.forwardMessage(code, "receiver", receiver,
+      var blocked = executor.submit(() -> forward(code, "receiver", receiver,
           WebRTCMessage.builder().type("candidate").build()));
       assertTrue(sending.await(2, TimeUnit.SECONDS));
       var membership = executor.submit(() -> {
@@ -247,10 +256,10 @@ class WebRtcServiceTest {
     }).when(receiver).sendMessage(any());
     var executor = Executors.newSingleThreadExecutor();
     try {
-      var blocked = executor.submit(() -> service.forwardMessage(code, "sender", sender,
+      var blocked = executor.submit(() -> forward(code, "sender", sender,
           WebRTCMessage.builder().type("offer").build()));
       assertTrue(sending.await(2, TimeUnit.SECONDS));
-      service.forwardMessage(code, "sender", sender, WebRTCMessage.builder().type("candidate").build());
+      forward(code, "sender", sender, WebRTCMessage.builder().type("candidate").build());
       service.removeClient(code, "receiver", receiver);
       assertTrue(join("receiver", replacement, code));
       release.countDown();
@@ -308,7 +317,7 @@ class WebRtcServiceTest {
     }).when(receiver).sendMessage(any());
     var executor = Executors.newFixedThreadPool(2);
     try {
-      var blocked = executor.submit(() -> service.forwardMessage(code, "sender", sender,
+      var blocked = executor.submit(() -> forward(code, "sender", sender,
           WebRTCMessage.builder().type("offer").build()));
       assertTrue(sending.await(2, TimeUnit.SECONDS));
       rooms().get(code).setExpiresAt(LocalDateTime.now().minusSeconds(1));
@@ -359,7 +368,7 @@ class WebRtcServiceTest {
   }
 
   @Test
-  void slowPeerQueueOverflowRetiresRoomAndDiscardsBacklog() throws Exception {
+  void slowPeerQueueOverflowRemovesOnlyThatPeerAndDiscardsBacklog() throws Exception {
     WebSocketSession sender = session("sender");
     WebSocketSession receiver = session("receiver");
     join("sender", sender, code);
@@ -374,17 +383,18 @@ class WebRtcServiceTest {
     }).when(receiver).sendMessage(any());
     var executor = Executors.newSingleThreadExecutor();
     try {
-      var blocked = executor.submit(() -> service.forwardMessage(code, "sender", sender,
+      var blocked = executor.submit(() -> forward(code, "sender", sender,
           WebRTCMessage.builder().type("offer").build()));
       assertTrue(sending.await(2, TimeUnit.SECONDS));
       for (int i = 0; i < 257; i++) {
-        service.forwardMessage(code, "sender", sender, WebRTCMessage.builder().type("candidate").build());
+        forward(code, "sender", sender, WebRTCMessage.builder().type("candidate").build());
       }
-      assertFalse(rooms().containsKey(code));
+      assertTrue(rooms().containsKey(code));
+      assertTrue(rooms().get(code).getReceivers().isEmpty());
       release.countDown();
       blocked.get(2, TimeUnit.SECONDS);
       verify(receiver, times(1)).sendMessage(any());
-      verify(sender).close(CloseStatus.SESSION_NOT_RELIABLE);
+      verify(sender, never()).close(any());
       verify(receiver).close(CloseStatus.SESSION_NOT_RELIABLE);
     } finally {
       release.countDown();
@@ -402,7 +412,7 @@ class WebRtcServiceTest {
       return null;
     }).when(rejected).close(any());
     assertFalse(join("sender", rejected, code));
-    service.forwardMessage(code, "sender", rejected, WebRTCMessage.builder().type("offer").build());
+    forward(code, "sender", rejected, WebRTCMessage.builder().type("offer").build());
     verify(rejected).close(com.file_drop.constant.SignalingError.ROLE_OCCUPIED.closeStatus());
     verify(rejected).close(CloseStatus.POLICY_VIOLATION);
   }

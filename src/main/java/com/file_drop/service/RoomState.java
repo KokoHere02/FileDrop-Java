@@ -12,7 +12,7 @@ import java.util.Map;
 /** State and FIFO are guarded by this object's monitor; network I/O never is. */
 final class RoomState extends WebRTCRoom {
   final ArrayDeque<Delivery> deliveries = new ArrayDeque<>();
-  boolean draining;
+  final java.util.Set<String> drainingSessions = new java.util.HashSet<>();
   final Map<String, Heartbeat> heartbeats = new HashMap<>();
   final byte[] senderTokenHash;
 

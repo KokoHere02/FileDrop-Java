@@ -9,7 +9,7 @@ public class WebRTCRoom implements Serializable {
   private String type;
   private String code;
   private WebRTCClient sender; // 发送者
-  private WebRTCClient receiver;  // 接收者
+  private final java.util.Map<String, WebRTCClient> receivers = new java.util.LinkedHashMap<>();
   private LocalDateTime createdAt;
   private LocalDateTime expiresAt;
 

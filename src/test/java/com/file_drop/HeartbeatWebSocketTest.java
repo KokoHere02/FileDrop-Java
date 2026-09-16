@@ -195,8 +195,8 @@ class HeartbeatWebSocketTest {
           var readySecond = readSignal(second);
           assertEquals("peer-ready", readyFirst.getType());
           assertEquals("peer-ready", readySecond.getType());
-          assertEquals(true, ((java.util.Map<?, ?>) readyFirst.getPayload()).get("initiator"));
-          assertEquals(false, ((java.util.Map<?, ?>) readySecond.getPayload()).get("initiator"));
+          assertEquals(role.equals("sender"), ((java.util.Map<?, ?>) readyFirst.getPayload()).get("initiator"));
+          assertEquals(!role.equals("sender"), ((java.util.Map<?, ?>) readySecond.getPayload()).get("initiator"));
           assertEquals(acceptedFirst.getTo(), readySecond.getFrom());
           assertEquals(acceptedSecond.getTo(), readyFirst.getFrom());
         }

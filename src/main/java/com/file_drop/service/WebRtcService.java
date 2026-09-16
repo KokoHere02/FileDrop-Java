@@ -107,7 +107,7 @@ public class WebRtcService {
       else if (SENDER.equals(role) && !SenderCredential.matches(senderToken, room.senderTokenHash)) {
         failure = SignalingError.SENDER_UNAUTHORIZED;
       }
-      else if (client(room, role) != null) failure = SignalingError.ROLE_OCCUPIED;
+      else if (SENDER.equals(role) && room.getSender() != null) failure = SignalingError.ROLE_OCCUPIED;
       if (failure == null) {
         WebRTCClient joined = new WebRTCClient();
         joined.setId(RandomUtil.generateClientID());
@@ -116,13 +116,13 @@ public class WebRtcService {
         joined.setConn(new ConcurrentWebSocketSessionDecorator(session, 10000, 64 * 1024));
         room.heartbeats.put(session.getId(), new RoomState.Heartbeat(nanoTime.getAsLong()));
         if (SENDER.equals(role)) room.setSender(joined);
-        else room.setReceiver(joined);
-        WebRTCClient peer = peer(room, role);
+        else room.getReceivers().put(joined.getId(), joined);
         enqueue(room, joined, WebRTCMessage.builder().type(ACCEPTED).to(joined.getId())
-            .payload(Map.of("protocolVersion", 2, "code", code, "role", role, "clientId", joined.getId())).build());
-        if (peer != null && active(room)) {
-          enqueueReady(room, peer, joined, true);
-          if (active(room)) enqueueReady(room, joined, peer, false);
+            .payload(Map.of("protocolVersion", 3, "code", code, "role", role, "clientId", joined.getId())).build());
+        for (WebRTCClient peer : peers(room, joined)) {
+          if (!active(room)) break;
+          enqueueReady(room, peer, joined, SENDER.equals(peer.getRole()));
+          enqueueReady(room, joined, peer, SENDER.equals(joined.getRole()));
         }
       }
     }
@@ -155,16 +155,24 @@ public class WebRtcService {
     RoomState room = code == null ? null : rooms.get(code);
     if (room == null || !validRole(role)) return;
     synchronized (room) {
-      WebRTCClient leaving = client(room, role);
-      if (!owns(leaving, session)) return;
-      room.heartbeats.remove(session.getId());
-      if (SENDER.equals(role)) room.setSender(null);
-      else room.setReceiver(null);
-      WebRTCClient peer = peer(room, role);
-      if (peer != null) enqueue(room, peer, WebRTCMessage.builder()
-          .type(RESET).from(leaving.getId()).to(peer.getId()).payload(RESET).build());
+      WebRTCClient leaving = client(room, role, session);
+      if (leaving == null) return;
+      detach(room, leaving);
     }
     drain(room);
+  }
+
+  private void detach(RoomState room, WebRTCClient leaving) {
+    java.util.List<WebRTCClient> peers = peers(room, leaving);
+    room.heartbeats.remove(leaving.getConn().getId());
+    if (SENDER.equals(leaving.getRole())) room.setSender(null);
+    else room.getReceivers().remove(leaving.getId());
+    room.deliveries.removeIf(d -> d.message() != null && d.closeStatus() == null
+        && d.session().getId().equals(leaving.getConn().getId()));
+    for (WebRTCClient peer : peers) {
+      enqueue(room, peer, WebRTCMessage.builder().type(RESET)
+          .from(leaving.getId()).to(peer.getId()).payload(RESET).build());
+    }
   }
 
   public void forwardMessage(String code, String role, WebSocketSession session, WebRTCMessage message) {
@@ -173,15 +181,20 @@ public class WebRtcService {
     boolean accepted;
     boolean expired;
     synchronized (room) {
-      WebRTCClient source = client(room, role);
+      WebRTCClient source = client(room, role, session);
       expired = !room.getExpiresAt().isAfter(LocalDateTime.now());
       if (expired) retire(room, SignalingError.ROOM_EXPIRED.closeStatus());
-      accepted = active(room) && owns(source, session);
+      accepted = active(room) && source != null;
       if (accepted) {
-        WebRTCClient target = peer(room, role);
-        if (target != null) {
+        WebRTCClient target = clientById(room, message.getTo());
+        String error = message.getTo() == null || message.getTo().isBlank() ? "TARGET_REQUIRED"
+            : target == null ? "TARGET_NOT_FOUND"
+            : target == source || source.getRole().equals(target.getRole()) ? "TARGET_FORBIDDEN" : null;
+        if (error != null) {
+          enqueue(room, source, WebRTCMessage.builder().type(ERROR).to(source.getId())
+              .payload(Map.of("code", error, "message", "Select an active peer in this room", "fatal", false)).build());
+        } else {
           message.setFrom(source.getId());
-          message.setTo(target.getId());
           enqueue(room, target, message);
         }
       }
@@ -207,7 +220,7 @@ public class WebRtcService {
     RoomState room = code == null ? null : rooms.get(code);
     if (room == null || !validRole(role)) return;
     synchronized (room) {
-      if (!owns(client(room, role), session)) return;
+      if (client(room, role, session) == null) return;
       RoomState.Heartbeat heartbeat = room.heartbeats.get(session.getId());
       if (heartbeat == null || heartbeat.pending == null || payload.remaining() != heartbeat.pending.length) return;
       byte[] echoed = new byte[payload.remaining()];
@@ -226,7 +239,7 @@ public class WebRtcService {
       synchronized (room) {
         if (!active(room)) return;
         checkHeartbeat(room, room.getSender(), now);
-        checkHeartbeat(room, room.getReceiver(), now);
+        for (WebRTCClient receiver : java.util.List.copyOf(room.getReceivers().values())) checkHeartbeat(room, receiver, now);
         if (!room.deliveries.isEmpty()) pendingCleanup.add(room);
       }
     });
@@ -240,20 +253,10 @@ public class WebRtcService {
     if (heartbeat.pending != null) {
       if (now - heartbeat.since < TimeUnit.MILLISECONDS.toNanos(heartbeatTimeoutMs)) return;
       // Release the role before any I/O, even when a previous send is still blocked.
-      room.heartbeats.remove(client.getConn().getId());
-      if (SENDER.equals(client.getRole())) room.setSender(null);
-      else room.setReceiver(null);
-      room.deliveries.removeIf(delivery -> delivery.session().getId().equals(client.getConn().getId())
-          && delivery.message() != null);
-      WebRTCClient peer = peer(room, client.getRole());
-      if (peer != null) enqueue(room, peer, WebRTCMessage.builder().type(RESET)
-          .from(client.getId()).to(peer.getId()).payload(RESET).build());
+      detach(room, client);
       room.deliveries.add(new RoomState.Delivery(client.getConn(), client.getRole(), null, HEARTBEAT_TIMEOUT));
     } else if (now - heartbeat.since >= TimeUnit.MILLISECONDS.toNanos(heartbeatIntervalMs)) {
-      if (room.deliveries.size() >= MAX_PENDING_MESSAGES) {
-        retire(room, CloseStatus.SESSION_NOT_RELIABLE);
-        return;
-      }
+      if (!hasCapacity(room, client)) return;
       heartbeat.pending = ByteBuffer.allocate(Long.BYTES).putLong(probeSequence.incrementAndGet()).array();
       // Deadline includes queueing, so a stuck writer cannot retain a role forever.
       heartbeat.since = now;
@@ -276,14 +279,20 @@ public class WebRtcService {
 
   /** Called only under the room lock; serializes an immutable message snapshot. */
   private void enqueue(RoomState room, WebRTCClient target, WebRTCMessage message) {
-    if (room.deliveries.size() >= MAX_PENDING_MESSAGES) {
-      // A slow peer must not allow the new application-level FIFO to grow indefinitely.
-      retire(room, CloseStatus.SESSION_NOT_RELIABLE);
-      return;
-    }
+    if (client(room, target.getRole(), target.getConn()) == null || !hasCapacity(room, target)) return;
     room.deliveries.add(new RoomState.Delivery(target.getConn(), target.getRole(),
         new TextMessage(JsonUtil.toJson(message)), null,
         PEER_READY.equals(message.getType()) ? message.getFrom() : null));
+  }
+
+  private boolean hasCapacity(RoomState room, WebRTCClient target) {
+    long queued = room.deliveries.stream().filter(d -> d.session().getId().equals(target.getConn().getId())
+        && d.closeStatus() == null).count();
+    if (queued < MAX_PENDING_MESSAGES) return true;
+    detach(room, target);
+    room.deliveries.add(new RoomState.Delivery(target.getConn(), target.getRole(), null, CloseStatus.SESSION_NOT_RELIABLE));
+    pendingCleanup.add(room);
+    return false;
   }
 
   /** Detach state immediately, then let the current drainer or cleanup worker close sockets. */
@@ -300,48 +309,54 @@ public class WebRtcService {
       }
     }
     if (!rooms.remove(room.getCode(), room)) return;
-    WebRTCClient sender = room.getSender();
-    WebRTCClient receiver = room.getReceiver();
+    java.util.List<WebRTCClient> occupants = new java.util.ArrayList<>(room.getReceivers().values());
+    if (room.getSender() != null) occupants.add(room.getSender());
     room.setSender(null);
-    room.setReceiver(null);
+    room.getReceivers().clear();
     room.heartbeats.clear();
-    room.deliveries.clear();
+    // Keep terminal deliveries for clients already detached by heartbeat or overflow.
+    room.deliveries.removeIf(delivery -> delivery.closeStatus() == null);
     TextMessage terminal = status.getCode() == 4410
         ? new TextMessage(JsonUtil.toJson(SignalingError.ROOM_EXPIRED.message())) : null;
-    if (sender != null) room.deliveries.add(new RoomState.Delivery(sender.getConn(), SENDER, terminal, status));
-    if (receiver != null) room.deliveries.add(new RoomState.Delivery(receiver.getConn(), RECEIVER, terminal, status));
+    for (WebRTCClient occupant : occupants) {
+      room.deliveries.add(new RoomState.Delivery(occupant.getConn(), occupant.getRole(), terminal, status));
+    }
     pendingCleanup.add(room);
   }
 
-  /** One caller drains a room at a time. Other callers only append and return. */
+  /** One writer per destination; concurrent callers can drain different destinations. */
   private void drain(RoomState room) {
-    synchronized (room) {
-      if (room.draining) return;
-      room.draining = true;
-    }
+    // FIFO per destination. A blocked socket does not own another destination's writer.
     while (true) {
-      RoomState.Delivery delivery;
+      String sessionId;
       synchronized (room) {
-        delivery = room.deliveries.poll();
-        if (delivery == null) {
-          room.draining = false;
-          pendingCleanup.remove(room);
-          return;
-        }
-        // Queued data belongs to a concrete session, never a replacement occupant.
-        if (delivery.closeStatus() == null && delivery.message() != null
-            && !owns(client(room, delivery.role()), delivery.session())) {
-          continue;
-        }
-        if (delivery.expectedPeerId() != null) {
-          WebRTCClient peer = peer(room, delivery.role());
-          if (peer == null || !delivery.expectedPeerId().equals(peer.getId())) continue;
-        }
+        sessionId = room.deliveries.stream().map(d -> d.session().getId())
+            .filter(id -> !room.drainingSessions.contains(id)).findFirst().orElse(null);
+        if (sessionId == null) return;
+        room.drainingSessions.add(sessionId);
       }
-      if (delivery.closeStatus() != null) {
-        sendTerminal(delivery.session(), delivery.message(), delivery.closeStatus());
-      } else {
-        send(room, delivery);
+      while (true) {
+        RoomState.Delivery delivery = null;
+        synchronized (room) {
+          var iterator = room.deliveries.iterator();
+          while (iterator.hasNext()) {
+            RoomState.Delivery next = iterator.next();
+            if (next.session().getId().equals(sessionId)) {
+              delivery = next;
+              iterator.remove();
+              break;
+            }
+          }
+          if (delivery == null) {
+            room.drainingSessions.remove(sessionId);
+            if (room.deliveries.isEmpty()) pendingCleanup.remove(room);
+            break;
+          }
+          if (delivery.closeStatus() == null && client(room, delivery.role(), delivery.session()) == null) continue;
+          if (delivery.expectedPeerId() != null && clientById(room, delivery.expectedPeerId()) == null) continue;
+        }
+        if (delivery.closeStatus() != null) sendTerminal(delivery.session(), delivery.message(), delivery.closeStatus());
+        else send(room, delivery);
       }
     }
   }
@@ -354,12 +369,20 @@ public class WebRtcService {
     return SENDER.equals(role) || RECEIVER.equals(role);
   }
 
-  private WebRTCClient client(RoomState room, String role) {
-    return SENDER.equals(role) ? room.getSender() : room.getReceiver();
+  private WebRTCClient client(RoomState room, String role, WebSocketSession session) {
+    if (SENDER.equals(role)) return owns(room.getSender(), session) ? room.getSender() : null;
+    return room.getReceivers().values().stream().filter(c -> owns(c, session)).findFirst().orElse(null);
   }
 
-  private WebRTCClient peer(RoomState room, String role) {
-    return SENDER.equals(role) ? room.getReceiver() : room.getSender();
+  private WebRTCClient clientById(RoomState room, String id) {
+    if (id == null) return null;
+    if (room.getSender() != null && id.equals(room.getSender().getId())) return room.getSender();
+    return room.getReceivers().get(id);
+  }
+
+  private java.util.List<WebRTCClient> peers(RoomState room, WebRTCClient client) {
+    if (SENDER.equals(client.getRole())) return java.util.List.copyOf(room.getReceivers().values());
+    return room.getSender() == null ? java.util.List.of() : java.util.List.of(room.getSender());
   }
 
   private boolean owns(WebRTCClient client, WebSocketSession session) {
