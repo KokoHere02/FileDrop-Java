@@ -148,8 +148,8 @@ try {
     await waitState(first, s => s.accepted, 'first accepted');
     await connect(second, firstRole === 'sender' ? 'receiver' : 'sender');
     const states = await Promise.all([waitState(first, s => s.open, 'first channel open'), waitState(second, s => s.open, 'second channel open')]);
-    assert.equal(states[0].initiator, true);
-    assert.equal(states[1].initiator, false);
+    assert.equal(states[0].initiator, firstRole === 'sender');
+    assert.equal(states[1].initiator, firstRole !== 'sender');
     const file = await transfer(sender, receiver, 1024 * 1024 + 123);
     results.push({ scenario: `${firstRole}-first`, ...file, passed: true });
     if (firstRole === 'sender') {
@@ -163,8 +163,39 @@ try {
     await sender.close(); await receiver.close();
     console.log(`PASS ${firstRole}-first file transfer`);
   }
+  const thirdBrowser = await openBrowser(executable);
+  const sender = await page(firstBrowser, origin);
+  const receiverA = await page(secondBrowser, origin);
+  const receiverB = await page(thirdBrowser, origin);
+  const created = await sender.evaluate(`fetch(${JSON.stringify(base + '/web/createRoom?type=file')}, { method: 'POST' }).then(r => r.json()).then(r => r.data)`);
+  const connectMany = (peer, role) => peer.evaluate(`window.start(${JSON.stringify({ base, code: created.code, role,
+    ...(role === 'sender' ? { senderToken: created.senderToken } : {}) })})`);
+  await connectMany(receiverA, 'receiver');
+  await connectMany(receiverB, 'receiver');
+  await Promise.all([waitState(receiverA, s => s.accepted, 'A accepted'), waitState(receiverB, s => s.accepted, 'B accepted')]);
+  await connectMany(sender, 'sender');
+  await waitState(sender, s => Object.values(s.peers).filter(p => p.open).length === 2, 'two receiver channels');
+  const broadcast = await sender.evaluate('window.sendFile(2097275)');
+  for (const receiver of [receiverA, receiverB]) {
+    const state = await waitState(receiver, s => s.received?.size === broadcast.size, 'broadcast reception');
+    assert.deepEqual(state.received, broadcast);
+  }
+  await waitState(sender, s => Object.keys(s.acks).length === 2, 'both receivers acknowledged');
+  results.push({ scenario: 'one-sender-two-receivers', ...broadcast, passed: true });
+  await receiverA.close();
+  await waitState(sender, s => s.resets === 1 && Object.keys(s.peers).length === 1, 'A removed independently');
+  assert.equal((await receiverB.evaluate('window.state')).resets, 0);
+  results.push({ scenario: 'remaining-receiver-transfer', ...await transfer(sender, receiverB, 262151), passed: true });
+  const late = await page(secondBrowser, origin);
+  await connectMany(late, 'receiver');
+  const lateState = await waitState(late, s => s.received?.size === 262151, 'late receiver full replay');
+  assert.deepEqual(lateState.received, (await receiverB.evaluate('window.state')).received);
+  await waitState(sender, s => Object.keys(s.acks).length === 2, 'late receiver acknowledgement');
+  assert.equal((await receiverB.evaluate('window.state')).resets, 0);
+  results.push({ scenario: 'late-receiver-from-start', ...lateState.received, passed: true });
+  await sender.close(); await receiverB.close(); await late.close();
   await writeFile(resolve(output, 'result.json'), JSON.stringify({ passed: true, browser: version.product, scenarios: results }, null, 2));
-  console.log('PASS: two isolated browser processes, both join orders, SHA-256 checks and reconnect transfer');
+  console.log('PASS: three browser processes, broadcast, receiver isolation, late join, SHA-256 and reconnect');
 } catch (error) {
   await writeFile(resolve(output, 'result.json'), JSON.stringify({ passed: false, error: String(error), scenarios: results }, null, 2));
   console.error(String(error)); process.exitCode = 1;
