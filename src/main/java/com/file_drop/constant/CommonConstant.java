@@ -18,6 +18,7 @@ public class CommonConstant {
   public static final String CODE = "code";
 
   public static final String ROLE = "role";
+  public static final String SENDER_TOKEN = "senderToken";
 
   public static final String RESET = "reset";
 

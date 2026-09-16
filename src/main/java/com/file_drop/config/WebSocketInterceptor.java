@@ -38,6 +38,13 @@ public class WebSocketInterceptor implements HandshakeInterceptor {
       }
       attributes.put(CODE, code);
       attributes.put(ROLE, role);
+      if (query.get(SENDER_TOKEN) != null && query.get(SENDER_TOKEN).size() != 1) {
+        response.setStatusCode(HttpStatus.BAD_REQUEST);
+        return false;
+      }
+      if (SENDER.equals(role) && query.getFirst(SENDER_TOKEN) != null) {
+        attributes.put(SENDER_TOKEN, UriUtils.decode(query.getFirst(SENDER_TOKEN), StandardCharsets.UTF_8));
+      }
       return true;
     } catch (IllegalArgumentException e) {
       response.setStatusCode(HttpStatus.BAD_REQUEST);

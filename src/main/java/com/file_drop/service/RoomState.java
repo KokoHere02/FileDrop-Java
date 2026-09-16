@@ -14,9 +14,11 @@ final class RoomState extends WebRTCRoom {
   final ArrayDeque<Delivery> deliveries = new ArrayDeque<>();
   boolean draining;
   final Map<String, Heartbeat> heartbeats = new HashMap<>();
+  final byte[] senderTokenHash;
 
-  RoomState(String code) {
+  RoomState(String code, byte[] senderTokenHash) {
     super(code);
+    this.senderTokenHash = senderTokenHash.clone();
   }
 
   @Override

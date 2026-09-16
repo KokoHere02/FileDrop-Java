@@ -2,6 +2,8 @@ package com.file_drop.service;
 
 import com.file_drop.entity.WebRTCClient;
 import com.file_drop.entity.WebRTCMessage;
+import com.file_drop.entity.CreatedRoom;
+import com.file_drop.util.SenderCredential;
 import com.file_drop.constant.SignalingError;
 import com.file_drop.util.JsonUtil;
 import com.file_drop.util.RandomUtil;
@@ -72,22 +74,23 @@ public class WebRtcService {
         return thread;
       });
 
-  public String createRoom(String type) {
+  public CreatedRoom createRoom(String type) {
     if (type == null || type.isBlank() || type.length() > 64) {
       throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "type must contain 1 to 64 characters");
     }
     while (true) {
       String code = RandomUtil.generateCode(6);
-      RoomState room = new RoomState(code);
+      String senderToken = SenderCredential.generate();
+      RoomState room = new RoomState(code, SenderCredential.digest(senderToken));
       room.setType(type.trim());
       if (rooms.putIfAbsent(code, room) == null) {
         synchronized (expiredRooms) { expiredRooms.remove(code); }
-        return code;
+        return new CreatedRoom(code, senderToken);
       }
     }
   }
 
-  public boolean addClient(String role, WebSocketSession session, String code) {
+  public boolean addClient(String role, WebSocketSession session, String code, String senderToken) {
     if (!validRole(role) || code == null || !code.matches("[a-zA-Z0-9]{6}")) {
       reject(session, SignalingError.INVALID_PARAMETERS);
       return false;
@@ -101,6 +104,9 @@ public class WebRtcService {
     synchronized (room) {
       if (!room.getExpiresAt().isAfter(LocalDateTime.now())) failure = SignalingError.ROOM_EXPIRED;
       else if (rooms.get(code) != room) failure = missingRoomError(code);
+      else if (SENDER.equals(role) && !SenderCredential.matches(senderToken, room.senderTokenHash)) {
+        failure = SignalingError.SENDER_UNAUTHORIZED;
+      }
       else if (client(room, role) != null) failure = SignalingError.ROLE_OCCUPIED;
       if (failure == null) {
         WebRTCClient joined = new WebRTCClient();

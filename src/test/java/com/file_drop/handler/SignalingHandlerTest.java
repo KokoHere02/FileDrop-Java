@@ -10,6 +10,19 @@ import org.springframework.web.socket.WebSocketSession;
 import static org.mockito.Mockito.*;
 
 class SignalingHandlerTest {
+  @org.junit.jupiter.api.Test
+  void admissionConsumesCredentialWithoutRetainingItInAttributes() {
+    var service = mock(WebRtcService.class);
+    var session = mock(WebSocketSession.class);
+    var attributes = new java.util.HashMap<String, Object>();
+    attributes.put("code", "abc123");
+    attributes.put("role", "sender");
+    attributes.put("senderToken", "private-credential");
+    when(session.getAttributes()).thenReturn(attributes);
+    new SignalingHandler(service).afterConnectionEstablished(session);
+    verify(service).addClient("sender", session, "abc123", "private-credential");
+    org.junit.jupiter.api.Assertions.assertFalse(attributes.containsKey("senderToken"));
+  }
 
   @org.junit.jupiter.api.Test
   void pongIsPassedToLivenessCheck() throws Exception {

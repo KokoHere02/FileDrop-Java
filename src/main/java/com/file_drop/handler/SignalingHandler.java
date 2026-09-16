@@ -24,7 +24,7 @@ public class SignalingHandler extends TextWebSocketHandler {
   @Override
   public void afterConnectionEstablished(WebSocketSession session) {
     webRtcService.addClient((String) session.getAttributes().get(ROLE), session,
-        (String) session.getAttributes().get(CODE));
+        (String) session.getAttributes().get(CODE), (String) session.getAttributes().remove(SENDER_TOKEN));
   }
 
   @Override

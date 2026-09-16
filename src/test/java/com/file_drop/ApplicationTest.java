@@ -16,11 +16,13 @@ class ApplicationTest {
   private MockMvc mvc;
 
   @Test
-  void createsRoomWithExistingResponseShape() throws Exception {
+  void createsRoomWithPrivateSenderCredential() throws Exception {
     mvc.perform(post("/web/createRoom").param("type", "file"))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.code").value(200))
-        .andExpect(jsonPath("$.data").value(org.hamcrest.Matchers.matchesPattern("[a-zA-Z0-9]{6}")));
+        .andExpect(header().string("Cache-Control", "no-store"))
+        .andExpect(jsonPath("$.data.code").value(org.hamcrest.Matchers.matchesPattern("[a-zA-Z0-9]{6}")))
+        .andExpect(jsonPath("$.data.senderToken").value(org.hamcrest.Matchers.matchesPattern("[A-Za-z0-9_-]{43}")));
   }
 
   @Test

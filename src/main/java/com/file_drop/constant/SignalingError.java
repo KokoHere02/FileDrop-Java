@@ -7,6 +7,7 @@ import java.util.Map;
 
 public enum SignalingError {
   INVALID_PARAMETERS(4400, "Invalid room code or role"),
+  SENDER_UNAUTHORIZED(4403, "Sender credential missing or invalid"),
   ROOM_NOT_FOUND(4404, "Room not found"),
   ROOM_EXPIRED(4410, "Room expired"),
   ROLE_OCCUPIED(4409, "Role already occupied");

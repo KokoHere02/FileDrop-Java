@@ -17,7 +17,8 @@ class WebSocketInterceptorTest {
   @ParameterizedTest
   @ValueSource(strings = {"", "?code", "?code=&role=sender", "?code=abc123&role",
       "?code=abc123&role=admin", "?code=abc123&role=sender&role=receiver",
-      "?code=abc123&code=def456&role=sender", "?code=abc&role=sender"})
+      "?code=abc123&code=def456&role=sender", "?code=abc&role=sender",
+      "?code=abc123&role=sender&senderToken=a&senderToken=b"})
   void rejectsInvalidParameters(String query) {
     var request = mock(ServerHttpRequest.class);
     var response = mock(ServerHttpResponse.class);
@@ -38,5 +39,16 @@ class WebSocketInterceptorTest {
     assertEquals("sender", attributes.get("role"));
     assertEquals("abc123", attributes.get("code"));
     assertEquals(2, attributes.size());
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"sender", "receiver"})
+  void passesCredentialOnlyForSender(String role) {
+    var request = mock(ServerHttpRequest.class);
+    when(request.getURI()).thenReturn(URI.create("http://localhost/ws?code=abc123&role=" + role + "&senderToken=%61bc"));
+    var attributes = new HashMap<String, Object>();
+    assertTrue(new WebSocketInterceptor().beforeHandshake(request, mock(ServerHttpResponse.class),
+        mock(WebSocketHandler.class), attributes));
+    assertEquals(role.equals("sender") ? "abc" : null, attributes.get("senderToken"));
   }
 }

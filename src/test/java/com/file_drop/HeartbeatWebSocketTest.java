@@ -23,12 +23,18 @@ class HeartbeatWebSocketTest {
   @LocalServerPort private int port;
   @Autowired private WebRtcService service;
 
+  private final java.util.Map<String, String> senderTokens = new java.util.concurrent.ConcurrentHashMap<>();
 
+  private String createRoom() {
+    var created = service.createRoom("file");
+    senderTokens.put(created.code(), created.senderToken());
+    return created.code();
+  }
 
 
   @Test
   void realPongsKeepSessionAliveAndMissingPongAllowsReplacement() throws Exception {
-    String code = service.createRoom("file");
+    String code = createRoom();
     try (Socket socket = connect(code)) {
       assertEquals("accepted", readSignal(socket).getType());
       for (int i = 0; i < 3; i++) {
@@ -52,12 +58,16 @@ class HeartbeatWebSocketTest {
     return connect(code, "sender");
   }
 
-
   private Socket connect(String code, String role) throws Exception {
+    return connect(code, role, senderTokens.get(code));
+  }
+
+  private Socket connect(String code, String role, String senderToken) throws Exception {
     Socket socket = new Socket("127.0.0.1", port);
     socket.setSoTimeout(5000);
     try {
-      String request = "GET /api/ws?code=" + code + "&role=" + role + " HTTP/1.1\r\n"
+      String request = "GET /api/ws?code=" + code + "&role=" + role
+          + (senderToken == null ? "" : "&senderToken=" + senderToken) + " HTTP/1.1\r\n"
           + "Host: localhost:" + port + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
           + "Origin: http://localhost:5173\r\nSec-WebSocket-Version: 13\r\n"
           + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
@@ -120,7 +130,7 @@ class HeartbeatWebSocketTest {
   @Test
   void bothJoinOrdersReceiveAcceptedBeforeReadyWithOneInitiator() throws Exception {
     for (String role : new String[]{"sender", "receiver"}) {
-      String code = service.createRoom("file");
+      String code = createRoom();
       try (Socket first = connect(code, role)) {
         var acceptedFirst = readSignal(first);
         assertEquals("accepted", acceptedFirst.getType());
@@ -143,13 +153,13 @@ class HeartbeatWebSocketTest {
   @Test
   @SuppressWarnings("unchecked")
   void rejectionSendsSpecificErrorBeforeCorrespondingClose() throws Exception {
-    String occupied = service.createRoom("file");
+    String occupied = createRoom();
     try (Socket first = connect(occupied)) {
       assertEquals("accepted", readSignal(first).getType());
       assertRejection(occupied, "ROLE_OCCUPIED", 4409);
     }
     assertRejection("000000", "ROOM_NOT_FOUND", 4404);
-    String expired = service.createRoom("file");
+    String expired = createRoom();
     var rooms = (java.util.Map<String, com.file_drop.entity.WebRTCRoom>)
         org.springframework.test.util.ReflectionTestUtils.getField(service, "rooms");
     rooms.get(expired).setExpiresAt(java.time.LocalDateTime.now().minusSeconds(1));
@@ -169,4 +179,25 @@ class HeartbeatWebSocketTest {
     }
   }
 
+  @Test
+  void realSenderRequiresCredentialWhileReceiverCanUseOnlyRoomCode() throws Exception {
+    String code = createRoom();
+    for (String token : new String[]{null, "wrong", service.createRoom("file").senderToken()}) {
+      try (Socket rejected = connect(code, "sender", token)) {
+        var error = readSignal(rejected);
+        assertEquals("SENDER_UNAUTHORIZED", ((java.util.Map<?, ?>) error.getPayload()).get("code"));
+        Frame close = readFrame(rejected);
+        assertEquals(8, close.opcode());
+        assertEquals(4403, ByteBuffer.wrap(close.payload()).getShort());
+      }
+    }
+    try (Socket receiver = connect(code, "receiver", null)) {
+      assertEquals("accepted", readSignal(receiver).getType());
+      try (Socket sender = connect(code)) {
+        assertEquals("accepted", readSignal(sender).getType());
+        assertEquals("peer-ready", readSignal(sender).getType());
+        assertEquals("peer-ready", readSignal(receiver).getType());
+      }
+    }
+  }
 }

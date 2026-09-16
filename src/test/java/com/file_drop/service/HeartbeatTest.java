@@ -19,10 +19,19 @@ class HeartbeatTest {
   private final AtomicLong now = new AtomicLong();
   private final WebRtcService service = new WebRtcService(now::get);
 
+  private final java.util.Map<String, String> senderTokens = new java.util.concurrent.ConcurrentHashMap<>();
 
+  private String createRoom() {
+    var created = service.createRoom("file");
+    senderTokens.put(created.code(), created.senderToken());
+    return created.code();
+  }
 
-  private final String code = service.createRoom("file");
+  private final String code = createRoom();
 
+  private boolean join(String role, WebSocketSession session, String code) {
+    return service.addClient(role, session, code, code == null ? null : senderTokens.get(code));
+  }
 
 
   @AfterEach
@@ -54,7 +63,7 @@ class HeartbeatTest {
   @Test
   void matchingPongKeepsConnectionAndNextProbeHasNewToken() throws Exception {
     WebSocketSession sender = session("sender");
-    service.addClient("sender", sender, code);
+    join("sender", sender, code);
     advance(19);
     verify(sender, never()).sendMessage(any(PingMessage.class));
     advance(1);
@@ -66,15 +75,15 @@ class HeartbeatTest {
     assertNotEquals(first.getPayload(), capture.getValue().getPayload());
     service.receivePong(code, "sender", sender, capture.getValue().getPayload());
     verify(sender, never()).close(any());
-    assertFalse(service.addClient("sender", session("duplicate"), code));
+    assertFalse(join("sender", session("duplicate"), code));
   }
 
   @Test
   void timeoutReleasesRoleNotifiesPeerAndIgnoresOldCallbacks() throws Exception {
     WebSocketSession sender = session("sender");
     WebSocketSession receiver = session("receiver");
-    service.addClient("sender", sender, code);
-    service.addClient("receiver", receiver, code);
+    join("sender", sender, code);
+    join("receiver", receiver, code);
     advance(20);
     PingMessage oldPing = ping(sender);
     PingMessage peerPing = ping(receiver);
@@ -85,17 +94,17 @@ class HeartbeatTest {
     verify(receiver, timeout(2000)).sendMessage(argThat(message -> message instanceof TextMessage
         && JsonUtil.fromJson(((TextMessage) message).getPayload(), WebRTCMessage.class).getType().equals("reset")));
     WebSocketSession replacement = session("replacement");
-    assertTrue(service.addClient("sender", replacement, code));
+    assertTrue(join("sender", replacement, code));
     service.removeClient(code, "sender", sender);
     service.receivePong(code, "sender", sender, oldPing.getPayload());
-    assertFalse(service.addClient("sender", session("duplicate"), code));
+    assertFalse(join("sender", session("duplicate"), code));
     verify(receiver, never()).close(any());
   }
 
   @Test
   void unsolicitedMismatchedAndStalePongsDoNotRefreshDeadline() throws Exception {
     WebSocketSession sender = session("sender");
-    service.addClient("sender", sender, code);
+    join("sender", sender, code);
     service.receivePong(code, "sender", sender, ByteBuffer.wrap(new byte[]{1}));
     advance(20);
     PingMessage first = ping(sender);
@@ -106,13 +115,13 @@ class HeartbeatTest {
     service.receivePong(code, "sender", sender, ByteBuffer.wrap(new byte[]{1}));
     advance(60);
     verify(sender, timeout(2000)).close(argThat(status -> status.getCode() == 4001));
-    assertTrue(service.addClient("sender", session("replacement"), code));
+    assertTrue(join("sender", session("replacement"), code));
   }
 
   @Test
   void blockedPingDoesNotBlockScanOrRoleRelease() throws Exception {
     WebSocketSession sender = session("sender");
-    service.addClient("sender", sender, code);
+    join("sender", sender, code);
     Map<?, ?> rooms = (Map<?, ?>) ReflectionTestUtils.getField(service, "rooms");
     Object room = rooms.get(code);
     CountDownLatch sending = new CountDownLatch(1);
@@ -128,7 +137,7 @@ class HeartbeatTest {
       scanner.submit(() -> advance(20)).get(2, TimeUnit.SECONDS);
       assertTrue(sending.await(2, TimeUnit.SECONDS));
       scanner.submit(() -> advance(60)).get(2, TimeUnit.SECONDS);
-      assertTrue(service.addClient("sender", session("replacement"), code));
+      assertTrue(join("sender", session("replacement"), code));
       release.countDown();
       verify(sender, timeout(2000)).close(argThat(status -> status.getCode() == 4001));
     } finally {
@@ -140,10 +149,10 @@ class HeartbeatTest {
   @Test
   void pingSendFailureReleasesRole() throws Exception {
     WebSocketSession sender = session("sender");
-    service.addClient("sender", sender, code);
+    join("sender", sender, code);
     doThrow(new java.io.IOException("network lost")).when(sender).sendMessage(any(PingMessage.class));
     advance(20);
     verify(sender, timeout(2000)).close(CloseStatus.SERVER_ERROR);
-    assertTrue(service.addClient("sender", session("replacement"), code));
+    assertTrue(join("sender", session("replacement"), code));
   }
 }
