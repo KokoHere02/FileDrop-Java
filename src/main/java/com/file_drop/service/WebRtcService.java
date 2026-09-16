@@ -2,6 +2,7 @@ package com.file_drop.service;
 
 import com.file_drop.entity.WebRTCClient;
 import com.file_drop.entity.WebRTCMessage;
+import com.file_drop.constant.SignalingError;
 import com.file_drop.util.JsonUtil;
 import com.file_drop.util.RandomUtil;
 import jakarta.annotation.PreDestroy;
@@ -22,6 +23,8 @@ import java.io.IOException;
 import java.time.LocalDateTime;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 import java.util.Set;
@@ -56,6 +59,10 @@ public class WebRtcService {
     }
   }
   private final ConcurrentHashMap<String, RoomState> rooms = new ConcurrentHashMap<>();
+  // Bounded, process-local tombstones retain useful errors after expiry cleanup.
+  private final Map<String, Long> expiredRooms = new LinkedHashMap<>();
+  private static final int MAX_EXPIRED_ROOMS = 10000;
+  private static final long EXPIRED_RETENTION_NANOS = TimeUnit.HOURS.toNanos(24);
   // Retain deferred cleanup when the bounded executor is full; the next sweep retries it.
   private final Set<RoomState> pendingCleanup = ConcurrentHashMap.newKeySet();
   private final ThreadPoolExecutor cleanupExecutor = new ThreadPoolExecutor(
@@ -73,20 +80,29 @@ public class WebRtcService {
       String code = RandomUtil.generateCode(6);
       RoomState room = new RoomState(code);
       room.setType(type.trim());
-      if (rooms.putIfAbsent(code, room) == null) return code;
+      if (rooms.putIfAbsent(code, room) == null) {
+        synchronized (expiredRooms) { expiredRooms.remove(code); }
+        return code;
+      }
     }
   }
 
   public boolean addClient(String role, WebSocketSession session, String code) {
-    RoomState room = code == null ? null : rooms.get(code);
-    if (!validRole(role) || room == null) {
-      close(session, CloseStatus.POLICY_VIOLATION);
+    if (!validRole(role) || code == null || !code.matches("[a-zA-Z0-9]{6}")) {
+      reject(session, SignalingError.INVALID_PARAMETERS);
       return false;
     }
-    boolean accepted;
+    RoomState room = rooms.get(code);
+    if (room == null) {
+      reject(session, missingRoomError(code));
+      return false;
+    }
+    SignalingError failure = null;
     synchronized (room) {
-      accepted = active(room) && client(room, role) == null;
-      if (accepted) {
+      if (!room.getExpiresAt().isAfter(LocalDateTime.now())) failure = SignalingError.ROOM_EXPIRED;
+      else if (rooms.get(code) != room) failure = missingRoomError(code);
+      else if (client(room, role) != null) failure = SignalingError.ROLE_OCCUPIED;
+      if (failure == null) {
         WebRTCClient joined = new WebRTCClient();
         joined.setId(RandomUtil.generateClientID());
         joined.setRole(role);
@@ -96,13 +112,37 @@ public class WebRtcService {
         if (SENDER.equals(role)) room.setSender(joined);
         else room.setReceiver(joined);
         WebRTCClient peer = peer(room, role);
-        if (peer != null) enqueue(room, peer, WebRTCMessage.builder()
-            .type(JOINED).from(joined.getId()).to(peer.getId()).payload(JOINED).build());
+        enqueue(room, joined, WebRTCMessage.builder().type(ACCEPTED).to(joined.getId())
+            .payload(Map.of("protocolVersion", 2, "code", code, "role", role, "clientId", joined.getId())).build());
+        if (peer != null && active(room)) {
+          enqueueReady(room, peer, joined, true);
+          if (active(room)) enqueueReady(room, joined, peer, false);
+        }
       }
     }
-    if (!accepted) close(session, CloseStatus.POLICY_VIOLATION);
+    if (failure != null) reject(session, failure);
     else drain(room);
-    return accepted;
+    return failure == null;
+  }
+
+  private void enqueueReady(RoomState room, WebRTCClient target, WebRTCClient peer, boolean initiator) {
+    enqueue(room, target, WebRTCMessage.builder().type(PEER_READY).from(peer.getId()).to(target.getId())
+        .payload(Map.of("peerId", peer.getId(), "peerRole", peer.getRole(), "initiator", initiator)).build());
+  }
+
+  private void reject(WebSocketSession session, SignalingError error) {
+    sendTerminal(session, new TextMessage(JsonUtil.toJson(error.message())), error.closeStatus());
+  }
+
+  private SignalingError missingRoomError(String code) {
+    synchronized (expiredRooms) {
+      Long expiredAt = expiredRooms.get(code);
+      if (expiredAt != null && nanoTime.getAsLong() - expiredAt < EXPIRED_RETENTION_NANOS) {
+        return SignalingError.ROOM_EXPIRED;
+      }
+      expiredRooms.remove(code);
+      return SignalingError.ROOM_NOT_FOUND;
+    }
   }
 
   public void removeClient(String code, String role, WebSocketSession session) {
@@ -125,8 +165,11 @@ public class WebRtcService {
     RoomState room = code == null ? null : rooms.get(code);
     if (room == null || !validRole(role)) return;
     boolean accepted;
+    boolean expired;
     synchronized (room) {
       WebRTCClient source = client(room, role);
+      expired = !room.getExpiresAt().isAfter(LocalDateTime.now());
+      if (expired) retire(room, SignalingError.ROOM_EXPIRED.closeStatus());
       accepted = active(room) && owns(source, session);
       if (accepted) {
         WebRTCClient target = peer(room, role);
@@ -137,7 +180,8 @@ public class WebRtcService {
         }
       }
     }
-    if (!accepted) close(session, CloseStatus.POLICY_VIOLATION);
+    if (expired) drain(room);
+    else if (!accepted) close(session, CloseStatus.POLICY_VIOLATION);
     else drain(room);
   }
 
@@ -146,7 +190,7 @@ public class WebRtcService {
     rooms.forEach((code, room) -> {
       synchronized (room) {
         if (!room.getExpiresAt().isAfter(LocalDateTime.now())) {
-          retire(room, CloseStatus.NORMAL);
+          retire(room, SignalingError.ROOM_EXPIRED.closeStatus());
         }
       }
     });
@@ -232,11 +276,23 @@ public class WebRtcService {
       return;
     }
     room.deliveries.add(new RoomState.Delivery(target.getConn(), target.getRole(),
-        new TextMessage(JsonUtil.toJson(message)), null));
+        new TextMessage(JsonUtil.toJson(message)), null,
+        PEER_READY.equals(message.getType()) ? message.getFrom() : null));
   }
 
   /** Detach state immediately, then let the current drainer or cleanup worker close sockets. */
   private void retire(RoomState room, CloseStatus status) {
+    if (rooms.get(room.getCode()) != room) return;
+    if (status.getCode() == 4410) {
+      synchronized (expiredRooms) {
+        long now = nanoTime.getAsLong();
+        expiredRooms.entrySet().removeIf(entry -> now - entry.getValue() >= EXPIRED_RETENTION_NANOS);
+        expiredRooms.put(room.getCode(), now);
+        while (expiredRooms.size() > MAX_EXPIRED_ROOMS) {
+          expiredRooms.remove(expiredRooms.keySet().iterator().next());
+        }
+      }
+    }
     if (!rooms.remove(room.getCode(), room)) return;
     WebRTCClient sender = room.getSender();
     WebRTCClient receiver = room.getReceiver();
@@ -244,8 +300,10 @@ public class WebRtcService {
     room.setReceiver(null);
     room.heartbeats.clear();
     room.deliveries.clear();
-    if (sender != null) room.deliveries.add(new RoomState.Delivery(sender.getConn(), SENDER, null, status));
-    if (receiver != null) room.deliveries.add(new RoomState.Delivery(receiver.getConn(), RECEIVER, null, status));
+    TextMessage terminal = status.getCode() == 4410
+        ? new TextMessage(JsonUtil.toJson(SignalingError.ROOM_EXPIRED.message())) : null;
+    if (sender != null) room.deliveries.add(new RoomState.Delivery(sender.getConn(), SENDER, terminal, status));
+    if (receiver != null) room.deliveries.add(new RoomState.Delivery(receiver.getConn(), RECEIVER, terminal, status));
     pendingCleanup.add(room);
   }
 
@@ -265,12 +323,17 @@ public class WebRtcService {
           return;
         }
         // Queued data belongs to a concrete session, never a replacement occupant.
-        if (delivery.message() != null && !owns(client(room, delivery.role()), delivery.session())) {
+        if (delivery.closeStatus() == null && delivery.message() != null
+            && !owns(client(room, delivery.role()), delivery.session())) {
           continue;
+        }
+        if (delivery.expectedPeerId() != null) {
+          WebRTCClient peer = peer(room, delivery.role());
+          if (peer == null || !delivery.expectedPeerId().equals(peer.getId())) continue;
         }
       }
       if (delivery.closeStatus() != null) {
-        close(delivery.session(), delivery.closeStatus());
+        sendTerminal(delivery.session(), delivery.message(), delivery.closeStatus());
       } else {
         send(room, delivery);
       }
@@ -316,6 +379,17 @@ public class WebRtcService {
       session.close(status);
     } catch (IOException | RuntimeException e) {
       log.warn("Failed to close session {}", session.getId(), e);
+    }
+  }
+
+  private void sendTerminal(WebSocketSession session, org.springframework.web.socket.WebSocketMessage<?> message,
+      CloseStatus status) {
+    try {
+      if (message != null && session.isOpen()) session.sendMessage(message);
+    } catch (IOException | RuntimeException e) {
+      log.debug("Failed to send terminal message to session {}", session.getId(), e);
+    } finally {
+      close(session, status);
     }
   }
 

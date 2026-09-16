@@ -55,7 +55,8 @@ public class SignalingHandler extends TextWebSocketHandler {
       return;
     }
     if (msg == null || msg.getType() == null || msg.getType().isBlank()
-        || JOINED.equals(msg.getType()) || RESET.equals(msg.getType())) {
+        || JOINED.equals(msg.getType()) || RESET.equals(msg.getType())
+        || ACCEPTED.equals(msg.getType()) || PEER_READY.equals(msg.getType()) || ERROR.equals(msg.getType())) {
       session.close(CloseStatus.BAD_DATA);
       return;
     }

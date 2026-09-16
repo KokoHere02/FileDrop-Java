@@ -10,6 +10,7 @@ import org.springframework.web.socket.WebSocketSession;
 import static org.mockito.Mockito.*;
 
 class SignalingHandlerTest {
+
   @org.junit.jupiter.api.Test
   void pongIsPassedToLivenessCheck() throws Exception {
     var service = mock(WebRtcService.class);
@@ -22,7 +23,8 @@ class SignalingHandlerTest {
 
   @ParameterizedTest
   @ValueSource(strings = {"{", "null", "[]", "{}", "{\"type\":\"\"}",
-      "{\"type\":\"joined\"}", "{\"type\":\"reset\"}"})
+      "{\"type\":\"joined\"}", "{\"type\":\"reset\"}", "{\"type\":\"accepted\"}",
+      "{\"type\":\"peer-ready\"}", "{\"type\":\"error\"}"})
   void malformedAndServerReservedMessagesAreRejected(String payload) throws Exception {
     var service = mock(WebRtcService.class);
     var session = mock(WebSocketSession.class);

@@ -18,7 +18,12 @@ import static org.mockito.Mockito.*;
 class HeartbeatTest {
   private final AtomicLong now = new AtomicLong();
   private final WebRtcService service = new WebRtcService(now::get);
+
+
+
   private final String code = service.createRoom("file");
+
+
 
   @AfterEach
   void stop() throws Exception {
@@ -51,7 +56,7 @@ class HeartbeatTest {
     WebSocketSession sender = session("sender");
     service.addClient("sender", sender, code);
     advance(19);
-    verify(sender, never()).sendMessage(any());
+    verify(sender, never()).sendMessage(any(PingMessage.class));
     advance(1);
     PingMessage first = ping(sender);
     service.receivePong(code, "sender", sender, first.getPayload());

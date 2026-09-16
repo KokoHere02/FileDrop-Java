@@ -32,5 +32,10 @@ final class RoomState extends WebRTCRoom {
     Heartbeat(long now) { since = now; }
   }
 
-  record Delivery(WebSocketSession session, String role, WebSocketMessage<?> message, CloseStatus closeStatus) {}
+  record Delivery(WebSocketSession session, String role, WebSocketMessage<?> message, CloseStatus closeStatus,
+                  String expectedPeerId) {
+    Delivery(WebSocketSession session, String role, WebSocketMessage<?> message, CloseStatus closeStatus) {
+      this(session, role, message, closeStatus, null);
+    }
+  }
 }

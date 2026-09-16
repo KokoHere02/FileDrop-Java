@@ -26,7 +26,12 @@ import static org.mockito.Mockito.*;
 
 class WebRtcServiceTest {
   private final WebRtcService service = new WebRtcService();
+
+
+
   private final String code = service.createRoom("file");
+
+
 
   @AfterEach
   void shutdown() throws InterruptedException {
@@ -60,12 +65,35 @@ class WebRtcServiceTest {
   }
 
   @Test
+  void failedAdmissionConfirmationDoesNotPublishFalseReadiness() throws Exception {
+    WebSocketSession sender = session("sender");
+    WebSocketSession receiver = session("receiver");
+    service.addClient("sender", sender, code);
+    clearInvocations(sender);
+    doThrow(new IOException("confirmation failed")).when(receiver).sendMessage(any());
+    service.addClient("receiver", receiver, code);
+    var capture = org.mockito.ArgumentCaptor.forClass(TextMessage.class);
+    verify(sender).sendMessage(capture.capture());
+    assertEquals("reset", JsonUtil.fromJson(capture.getValue().getPayload(), WebRTCMessage.class).getType());
+    assertTrue(service.addClient("receiver", session("replacement"), code));
+  }
+
+  @Test
+  void rejectedAdmissionStillClosesWhenErrorMessageCannotBeSent() throws Exception {
+    WebSocketSession invalid = session("invalid");
+    doThrow(new IOException("socket unavailable")).when(invalid).sendMessage(any());
+    assertFalse(service.addClient("sender", invalid, "absent"));
+    verify(invalid).close(com.file_drop.constant.SignalingError.ROOM_NOT_FOUND.closeStatus());
+  }
+
+  @Test
   void rejectedConnectionCannotEvictOrImpersonateOccupant() throws Exception {
     WebSocketSession sender = session("sender");
     WebSocketSession receiver = session("receiver");
     WebSocketSession intruder = session("intruder");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     assertFalse(service.addClient("sender", intruder, code));
     service.removeClient(code, "sender", intruder);
     service.forwardMessage(code, "sender", intruder, WebRTCMessage.builder().type("offer").build());
@@ -85,9 +113,10 @@ class WebRtcServiceTest {
       service.addClient(firstRole, first, roomCode);
       service.addClient(secondRole, second, roomCode);
       var capture = org.mockito.ArgumentCaptor.forClass(TextMessage.class);
-      verify(first).sendMessage(capture.capture());
+      verify(first, times(2)).sendMessage(capture.capture());
       WebRTCMessage joined = JsonUtil.fromJson(capture.getValue().getPayload(), WebRTCMessage.class);
-      assertEquals("joined", joined.getType());
+      assertEquals("peer-ready", joined.getType());
+      clearInvocations(second);
       assertNotEquals(joined.getFrom(), joined.getTo());
       service.forwardMessage(roomCode, firstRole, first,
           WebRTCMessage.builder().type("offer").from("spoofed").to("spoofed").payload("sdp").build());
@@ -105,6 +134,7 @@ class WebRtcServiceTest {
     WebSocketSession receiver = session("receiver");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     doThrow(new IOException("disconnected")).when(sender).sendMessage(any());
     service.removeClient(code, "receiver", receiver);
     assertTrue(service.addClient("receiver", session("new-receiver"), code));
@@ -135,7 +165,7 @@ class WebRtcServiceTest {
     assertFalse(service.addClient("receiver", session("receiver"), code));
     service.removeExpiredRooms();
     assertFalse(rooms.containsKey(code));
-    verify(sender, timeout(2000)).close(CloseStatus.NORMAL);
+    verify(sender, timeout(2000)).close(com.file_drop.constant.SignalingError.ROOM_EXPIRED.closeStatus());
   }
 
   @Test
@@ -144,7 +174,8 @@ class WebRtcServiceTest {
     assertFalse(service.addClient(null, invalid, null));
     assertFalse(service.addClient("unknown", invalid, code));
     assertFalse(service.addClient("sender", invalid, "absent"));
-    verify(invalid, times(3)).close(CloseStatus.POLICY_VIOLATION);
+    verify(invalid, times(2)).close(com.file_drop.constant.SignalingError.INVALID_PARAMETERS.closeStatus());
+    verify(invalid).close(com.file_drop.constant.SignalingError.ROOM_NOT_FOUND.closeStatus());
     assertThrows(ResponseStatusException.class, () -> service.createRoom(" "));
   }
 
@@ -154,6 +185,7 @@ class WebRtcServiceTest {
     WebSocketSession receiver = session("receiver");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     WebRTCRoom room = rooms().get(code);
     CountDownLatch sending = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
@@ -182,7 +214,7 @@ class WebRtcServiceTest {
       assertEquals(List.of("candidate"), messages);
       release.countDown();
       blocked.get(2, TimeUnit.SECONDS);
-      assertEquals(List.of("candidate", "reset", "joined"), messages);
+      assertEquals(List.of("candidate", "reset", "peer-ready"), messages);
     } finally {
       release.countDown();
       executor.shutdownNow();
@@ -196,6 +228,7 @@ class WebRtcServiceTest {
     WebSocketSession replacement = session("replacement");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     CountDownLatch sending = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
     doAnswer(invocation -> {
@@ -214,7 +247,7 @@ class WebRtcServiceTest {
       release.countDown();
       blocked.get(2, TimeUnit.SECONDS);
       verify(receiver, times(1)).sendMessage(any());
-      verify(replacement, never()).sendMessage(any());
+      verify(replacement, times(2)).sendMessage(any());
     } finally {
       release.countDown();
       executor.shutdownNow();
@@ -256,6 +289,7 @@ class WebRtcServiceTest {
     WebSocketSession receiver = session("receiver");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     CountDownLatch sending = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
     doAnswer(invocation -> {
@@ -273,8 +307,8 @@ class WebRtcServiceTest {
       assertFalse(rooms().containsKey(code));
       release.countDown();
       blocked.get(2, TimeUnit.SECONDS);
-      verify(sender, timeout(2000)).close(CloseStatus.NORMAL);
-      verify(receiver, timeout(2000)).close(CloseStatus.NORMAL);
+      verify(sender, timeout(2000)).close(com.file_drop.constant.SignalingError.ROOM_EXPIRED.closeStatus());
+      verify(receiver, timeout(2000)).close(com.file_drop.constant.SignalingError.ROOM_EXPIRED.closeStatus());
     } finally {
       release.countDown();
       executor.shutdownNow();
@@ -309,7 +343,7 @@ class WebRtcServiceTest {
       org.awaitility.Awaitility.await().atMost(2, TimeUnit.SECONDS)
           .until(() -> cleanup.getQueue().isEmpty());
       service.removeExpiredRooms();
-      verify(sender, timeout(2000)).close(CloseStatus.NORMAL);
+      verify(sender, timeout(2000)).close(com.file_drop.constant.SignalingError.ROOM_EXPIRED.closeStatus());
     } finally {
       release.countDown();
     }
@@ -321,6 +355,7 @@ class WebRtcServiceTest {
     WebSocketSession receiver = session("receiver");
     service.addClient("sender", sender, code);
     service.addClient("receiver", receiver, code);
+    clearInvocations(sender, receiver);
     CountDownLatch sending = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
     doAnswer(invocation -> {
@@ -359,6 +394,7 @@ class WebRtcServiceTest {
     }).when(rejected).close(any());
     assertFalse(service.addClient("sender", rejected, code));
     service.forwardMessage(code, "sender", rejected, WebRTCMessage.builder().type("offer").build());
-    verify(rejected, times(2)).close(CloseStatus.POLICY_VIOLATION);
+    verify(rejected).close(com.file_drop.constant.SignalingError.ROLE_OCCUPIED.closeStatus());
+    verify(rejected).close(CloseStatus.POLICY_VIOLATION);
   }
 }
