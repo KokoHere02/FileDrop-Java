@@ -1,0 +1,7 @@
+# Only send files required by the Maven build.
+**
+!pom.xml
+!src/
+!src/**
+!Dockerfile
+!.dockerignore
